@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.15)
+project(MTPL VERSION 1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Header-only library
+add_library(mtpl INTERFACE)
+target_include_directories(mtpl INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:include>
+)
+
+# Tests (optional, only build if this is the main project)
+if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    add_executable(test_mtpl_core tests/test_mtpl_core.cpp)
+    target_link_libraries(test_mtpl_core mtpl)
+endif()
