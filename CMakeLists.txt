@@ -13,6 +13,12 @@ target_include_directories(mtpl INTERFACE
 
 # Tests (optional, only build if this is the main project)
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
+    include(CTest)
     add_executable(test_mtpl_core tests/test_mtpl_core.cpp)
     target_link_libraries(test_mtpl_core mtpl)
+    add_test(NAME test_mtpl_core COMMAND test_mtpl_core)
+    
+    add_executable(test_signal_transform tests/test_signal_transform.cpp)
+    target_link_libraries(test_signal_transform mtpl)
+    add_test(NAME test_signal_transform COMMAND test_signal_transform)
 endif()

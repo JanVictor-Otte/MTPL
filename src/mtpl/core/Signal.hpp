@@ -4,6 +4,7 @@
 #include <tuple>
 #include <memory>
 #include <vector>
+#include <any>
 
 // ============================================================================
 //  FrozenSignal<T,E>        — evaluator: E → T
@@ -55,6 +56,9 @@ private:
 template<typename T, typename E>
 class ConstantSignal;  // forward
 
+template<typename T, typename E, typename... ValueTypes>
+class SignalTransform;  // forward
+
 template<typename T, typename E>
 class Signal {
 public:
@@ -70,8 +74,25 @@ public:
 
     FrozenSignal<T,E> operator()() const { return fn_(); }
 
+    // Introspection API
+    const std::vector<std::any>& inputs() const { return inputs_; }
+    const std::any& metadata() const { return metadata_; }
+    const std::any& transform() const { return transform_; }
+
+    // Helper to populate introspection from transform
+    template<typename Transform>
+    void setFromTransform(const Transform& t, const std::vector<std::any>& inp) {
+        transform_ = std::any(t);
+        inputs_ = inp;
+    }
+
 protected:
     std::function<FrozenSignal<T,E>()> fn_;
+    std::vector<std::any> inputs_;
+    std::any metadata_;
+    std::any transform_;
+
+    friend class SignalTransform<T, E>;
 };
 
 template<typename T, typename E>
@@ -90,7 +111,6 @@ public:
 private:
     ConstFn constFn_;
 };
-
 
 // Type trait to detect Signal and ConstantSignal types
 template<typename T>
@@ -113,6 +133,197 @@ struct is_constant_signal<ConstantSignal<T,E>> : std::true_type {};
 
 template<typename T>
 inline constexpr bool is_constant_signal_v = is_constant_signal<T>::value;
+
+// Helper trait to check if all args are "constant" (either ConstantSignal or primitive value)
+template<typename... Args>
+struct all_constant_or_primitive {
+    static constexpr bool value = true;
+};
+
+template<typename T, typename E, typename... Rest>
+struct all_constant_or_primitive<ConstantSignal<T, E>, Rest...> {
+    static constexpr bool value = all_constant_or_primitive<Rest...>::value;
+};
+
+template<typename T, typename E, typename... Rest>
+struct all_constant_or_primitive<ConstantSignal<T, E>*, Rest...> {
+    static constexpr bool value = all_constant_or_primitive<Rest...>::value;
+};
+
+template<typename T, typename... Rest>
+struct all_constant_or_primitive<T, Rest...> {
+    static constexpr bool value = std::is_arithmetic_v<T> && all_constant_or_primitive<Rest...>::value;
+};
+
+template<>
+struct all_constant_or_primitive<> {
+    static constexpr bool value = true;
+};
+
+// Concepts for Morphism requirements
+template<typename T, typename E>
+concept SignalArg = is_signal_v<T> || is_constant_signal_v<T>;
+
+template<typename T, typename E>
+concept ConstantSignalArg = is_constant_signal_v<T>;
+
+template<typename T, typename E>
+concept ProjectIndex = std::is_integral_v<T>;
+
+// --- SignalTransform and subclasses ---
+
+template<typename T, typename E, typename... ValueTypes>
+class SignalTransform {
+public:
+    virtual ~SignalTransform() = default;
+
+    // Static factory for constant values
+    static ConstantSignal<T, E> Constant(T value) {
+        return ConstantSignal<T, E>([value]() {
+            return ConstantFrozenSignal<T, E>(value);
+        });
+    }
+
+    // Metadata
+    void setMetadata(std::any m) { metadata_ = m; }
+    std::any metadata() const { return metadata_; }
+
+protected:
+    std::any metadata_;
+};
+
+// --- Pushforward Transform ---
+
+template<typename T, typename E, typename... ValueTypes>
+class Pushforward : public SignalTransform<T, E, ValueTypes...> {
+public:
+    using Fn = std::function<T(ValueTypes...)>;
+
+    Pushforward(Fn fn) : fn_(std::move(fn)) {}
+
+    // All constant arguments (either ConstantSignal or primitive)
+    template<typename... Args>
+    std::enable_if_t<all_constant_or_primitive<Args...>::value, ConstantSignal<T, E>>
+    operator()(const Args&... args) {
+        auto inputs = std::vector<std::any>{std::any(args)...};
+        ConstantSignal<T, E> result(
+            [this, args...]() {
+                T val = std::apply(fn_, std::make_tuple(this->extractValue(args)()...));
+                return ConstantFrozenSignal<T, E>(val);
+            }
+        );
+        result.setFromTransform(*this, inputs);
+        return result;
+    }
+
+    // Mixed or contains at least one non-constant Signal
+    template<typename... Args>
+    std::enable_if_t<!all_constant_or_primitive<Args...>::value, Signal<T, E>>
+    operator()(const Args&... args) {
+        auto inputs = std::vector<std::any>{std::any(args)...};
+        Signal<T, E> result(
+            [this, args...]() -> FrozenSignal<T, E> {
+                auto frozen = std::make_tuple(this->normalizeToFrozen(args)...);
+                return [this, frozen](const E& e) -> T {
+                    return std::apply([this, &e](const auto&... fs) {
+                        return this->fn_(deref(fs, e)...);
+                    }, frozen);
+                };
+            }
+        );
+        result.setFromTransform(*this, inputs);
+        return result;
+    }
+
+private:
+    Fn fn_;
+
+    // Extract callable value from args - handles ConstantSignal, pointers, and primitives
+    template<typename Arg>
+    auto extractValue(const Arg& arg) const {
+        if constexpr (is_constant_signal_v<Arg>) {
+            // ConstantSignal - directly callable to get value
+            return [arg]() { return arg()(); };
+        } else if constexpr (std::is_pointer_v<Arg> && is_constant_signal_v<std::remove_pointer_t<Arg>>) {
+            // Pointer to ConstantSignal
+            return [arg]() { return (*arg)()(); };
+        } else {
+            // Primitive value - wrap to make callable
+            return [arg]() { return arg; };
+        }
+    }
+
+    // Normalize argument to FrozenSignal for evaluation
+    template<typename Arg>
+    auto normalizeToFrozen(const Arg& arg) const {
+        using ArgDecay = std::decay_t<Arg>;
+        
+        if constexpr (std::is_pointer_v<ArgDecay>) {
+            // Pointer to something - dereference and normalize
+            return normalizeToFrozen(*arg);
+        } else if constexpr (is_signal_v<ArgDecay>) {
+            // Plain Signal
+            return arg();
+        } else if constexpr (is_constant_signal_v<ArgDecay>) {
+            // ConstantSignal - wrap to yield constant
+            return FrozenSignal<T, E>([arg](const E&) { return arg()(); });
+        } else {
+            // Primitive value - wrap in FrozenSignal that ignores E
+            auto val = arg;
+            using ValType = decltype(val);
+            return FrozenSignal<T, E>([val](const E&) -> ValType { return val; });
+        }
+    }
+
+    template<typename FrozenSig>
+    auto deref(const FrozenSig& fs, const E& e) const {
+        return fs(e);
+    }
+
+    friend class Signal<T, E>;
+};
+
+// --- CastTransform ---
+
+template<typename Target, typename E, typename Source>
+class CastTransform : public SignalTransform<Target, E, Source> {
+public:
+    // All constant
+    ConstantSignal<Target, E> operator()(ConstantSignal<Source, E> arg) {
+        auto inputs = std::vector<std::any>{std::any(arg)};
+        ConstantSignal<Target, E> result(
+            [arg]() {
+                Source val = arg()();
+                return ConstantFrozenSignal<Target, E>(static_cast<Target>(val));
+            }
+        );
+        result.setFromTransform(*this, inputs);
+        return result;
+    }
+
+    // Mixed or non-constant
+    Signal<Target, E> operator()(Signal<Source, E> arg) {
+        auto inputs = std::vector<std::any>{std::any(arg)};
+        Signal<Target, E> result(
+            [arg]() -> FrozenSignal<Target, E> {
+                FrozenSignal<Source, E> frozen = arg();
+                return [frozen](const E& e) -> Target {
+                    return static_cast<Target>(frozen(e));
+                };
+            }
+        );
+        result.setFromTransform(*this, inputs);
+        return result;
+    }
+};
+
+// --- ApplyTransform (stub for now) ---
+
+template<typename T, typename E, typename... Args>
+class ApplyTransform : public SignalTransform<T, E, Args...> {
+    // Stub - not fully implemented yet
+};
+
 
 // ============================================================================
 //  map, pushforward, castSignal, apply

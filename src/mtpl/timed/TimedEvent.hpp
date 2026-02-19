@@ -1,5 +1,4 @@
 #pragma once
-#include "mtpl/core/Event.hpp"
 #include "mtpl/core/Source.hpp"
 #include <algorithm>
 #include <stdexcept>
