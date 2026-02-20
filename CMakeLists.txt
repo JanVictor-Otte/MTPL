@@ -21,4 +21,8 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     add_executable(test_signal_transform tests/test_signal_transform.cpp)
     target_link_libraries(test_signal_transform mtpl)
     add_test(NAME test_signal_transform COMMAND test_signal_transform)
+    
+    add_executable(test_immutability tests/test_immutability.cpp)
+    target_link_libraries(test_immutability mtpl)
+    add_test(NAME test_immutability COMMAND test_immutability)
 endif()

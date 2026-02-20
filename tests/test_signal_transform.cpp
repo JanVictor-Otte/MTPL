@@ -67,12 +67,10 @@ void test_auto_cast_non_signal() {
         std::function<int(int, int)>([](int x, int y) { return x + y; })
     );
     
-    // Mix Signal with primitive value - returns Signal (not all-constant)
-    Signal<int, TestEvent> result = transform(a, 3);
+    // Mix Signal with primitive value - returns ConstantSignal (all constant-compatible)
+    ConstantSignal<int, TestEvent> result = transform(a, 3);
     
-    auto frozen = result();
-    TestEvent e{{0}};
-    int val = frozen(e);
+    int val = result()();
     assert(val == 10 && "Expected 7+3=10");
     
     std::cout << "  ✓ Auto-cast: 7 + 3 = " << val << std::endl;
@@ -86,14 +84,13 @@ void test_all_primitives() {
         std::function<int(int, int)>([](int x, int y) { return x + y; })
     );
     
-    // All primitives - should return ConstantSignal
-    // (they all auto-cast to ConstantSignals, so we have all-ConstantSignal)
+    // All primitives - should return ConstantSignal (auto-wrapped)
     ConstantSignal<int, TestEvent> result = transform(5, 7);
     
     int val = result()();
     assert(val == 12 && "Expected 5+7=12");
     
-    std::cout << "  ✓ All primitives: 5 + 7 = " << val << std::endl;
+    std::cout << "  \u2713 All primitives: 5 + 7 = " << val << std::endl;
 }
 
 void test_metadata_storage() {
@@ -162,7 +159,7 @@ void test_mixed_arg_types() {
     int val = frozen(e);
     assert(val == 60 && "Expected 10+20+30=60");
     
-    std::cout << "  ✓ Mixed types: lvalue Signal + rvalue primitive + pointer = " << val << std::endl;
+    std::cout << "  ✓ Mixed types: lvalue Signal + Signal + pointer = " << val << std::endl;
 }
 
 void test_pointer_signal_not_wrapped() {
@@ -326,21 +323,17 @@ void test_transform_metadata() {
     auto result = transform(a, b);
     
     // Check that transform is stored
-    if (result.transform().has_value()) {
+    if (result.transformPtr() != nullptr) {
         std::cout << "  ✓ Transform stored in result signal" << std::endl;
         
-        // Try to extract the transform
-        try {
-            auto extractedTransform = std::any_cast<Pushforward<int, TestEvent, int, int>>(result.transform());
-            if (extractedTransform.metadata().has_value()) {
-                auto meta = std::any_cast<std::string>(extractedTransform.metadata());
-                assert(meta == "multiplication" && "Expected multiplication metadata");
-                std::cout << "  ✓ Metadata preserved: " << meta << std::endl;
-            } else {
-                std::cout << "  ⚠ Metadata not stored" << std::endl;
-            }
-        } catch (...) {
-            std::cout << "  ⚠ Could not extract transform (type mismatch)" << std::endl;
+        // Try to downcast to the concrete transform type
+        auto* pf = dynamic_cast<const Pushforward<int, TestEvent, int, int>*>(result.transformPtr().get());
+        if (pf && pf->metadata().has_value()) {
+            auto meta = std::any_cast<std::string>(pf->metadata());
+            assert(meta == "multiplication" && "Expected multiplication metadata");
+            std::cout << "  ✓ Metadata preserved: " << meta << std::endl;
+        } else {
+            std::cout << "  ⚠ Could not extract transform metadata (type mismatch or no metadata)" << std::endl;
         }
     } else {
         std::cout << "  ✗ Transform not stored" << std::endl;

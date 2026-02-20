@@ -13,6 +13,65 @@
 //  ConstantSignal<T,E>      — factory: () → ConstantFrozenSignal<T,E>
 // ============================================================================
 namespace mtpl {
+
+
+// ============================================================================
+//  Category-theoretic notes (long form, intentionally verbose)
+//
+//  1) Objects and morphisms in code
+//     - A single Signal<T,E> value corresponds to one object in the category.
+//     - A SignalTransform<T,E,ValueTypes...> represents a family of morphisms
+//       that share the same shape: given inputs of types (ValueTypes...), it
+//       yields an output of type T. In code, this is a callable that can be
+//       applied to many concrete Signal objects of those types.
+//     - This is why a SignalTransform is not a single morphism but a structured
+//       family of morphisms parameterized by the particular input Signals.
+//
+//  2) Two categories: S and CS
+//     - S: objects are all Signals; morphisms are SignalTransforms (families of
+//       morphisms as described above) that produce Signals.
+//     - CS: objects are ConstantSignals; morphisms are ConstantSignalTransforms
+//       (not yet a separate type in the codebase, but conceptually present).
+//       CS is a subcategory of S because every ConstantSignal is also a Signal
+//       and every ConstantSignalTransform is a SignalTransform with additional
+//       structure.
+//
+//  3) Constant as a family of functors
+//     - Constant() is not itself a morphism in S. It is the object part of a
+//       family of functors F_e: S -> CS, indexed by a dummy event e.
+//     - Concretely, F_e on objects is just Constant(s, e): evaluate Signal s
+//       at the dummy event e to produce a ConstantSignal.
+//     - The family aspect matters: different e can give different ConstantSignals.
+//       This is why we avoid pretending Constant() is a morphism in S.
+//
+//  4) The restricted subcategory we actually implement
+//     - We explicitly restrict to a subcategory of S that has the same objects
+//       as S, but only those morphism-families that preserve constancy:
+//       if all inputs are ConstantSignals, the output must be a ConstantSignal.
+//     - Intuition: we disallow morphisms f : i(x) -> y where x is constant but
+//       y is not constant. That is, if inputs live in the embedded subcategory
+//       CS (via the inclusion i), then outputs must also land in CS.
+//     - This makes the "all-constant inputs -> ConstantSignal output" rule well
+//       defined and consistent with the functors F_e.
+//
+//  5) Why this matches the implementation
+//     - SignalTransform exposes a convenience: if all inputs are constant, the
+//       call returns a ConstantSignal. This encodes the restriction above and
+//       keeps the inspection tree coherent.
+//     - The action of F_e on morphisms is not represented directly because a
+//       SignalTransform groups many morphisms together. Still, for any concrete
+//       morphism picked out by a particular call, F_e(f) does not depend on e.
+//       We enforce the restriction at the API boundary: constant inputs produce
+//       constant outputs.
+//
+//  6) Actual object model in code
+//     - The practical category has objects that are finite collections of
+//       Signals, and morphisms whose target is always a singleton Signal.
+//     - This is the "multi-input, single-output" perspective used by the API.
+//       The above discussion generalizes immediately to that setting.
+// ============================================================================
+
+    
 // --- FrozenSignal ---
 
 template<typename T, typename E>
@@ -51,6 +110,52 @@ private:
     T val_;
 };
 
+// ============================================================================
+//  Signal type hierarchy base classes (tag types for concept dispatch)
+// ============================================================================
+
+template<typename E>
+struct SignalBase {};
+
+template<typename E>
+struct ConstantSignalBase {};
+
+
+// Singleton atoms stored in inputs_ for leaf signals
+template<typename E>
+struct SignalAtom : SignalBase<E> {};
+
+template<typename E>
+struct ConstantSignalAtom : SignalAtom<E>, ConstantSignalBase<E> {};
+
+// --- SignalTransformBase ---
+//
+// Abstract base that erases ValueTypes. Signal<T,E> holds a
+// shared_ptr<const SignalTransformBase<T,E>> — this is what makes
+// computation and introspection one and the same mechanism.
+
+template<typename T, typename E>
+class SignalTransformBase {
+public:
+    struct ConstantParts {
+        std::shared_ptr<const SignalTransformBase> transform;
+        std::vector<std::any> children;
+    };
+
+    virtual ~SignalTransformBase() = default;
+
+    // Given children (type-erased Signals), produce a FrozenSignal.
+    virtual FrozenSignal<T,E> apply(const std::vector<std::any>& children) const = 0;
+
+    // Produce the pieces needed to build a ConstantSignal from this
+    // transform. For tree transforms: same transform + constantified children.
+    // For leaf Elements: a new ConstantElement + ConstantSignalAtom.
+    virtual ConstantParts toConstantParts(const std::vector<std::any>& children, const E& e) const = 0;
+
+    // Deep copy (preserves derived type).
+    virtual std::shared_ptr<const SignalTransformBase> clone() const = 0;
+};
+
 // --- Signal ---
 
 template<typename T, typename E>
@@ -60,128 +165,223 @@ template<typename T, typename E, typename... ValueTypes>
 class SignalTransform;  // forward
 
 template<typename T, typename E>
-class Signal {
+class Element;  // forward
+
+template<typename T, typename E>
+class ConstantElement;  // forward
+
+template<typename T, typename E>
+class Signal : public SignalBase<E> {
 public:
-    using Fn = std::function<FrozenSignal<T,E>()>;
-
-    Signal(Fn fn) : fn_(std::move(fn)) {}
-
+    // Leaf constructor: wraps a factory function in an Element transform.
+    // Body is deferred to after Element is defined.
     template<typename F,
              typename = std::enable_if_t<
                  !std::is_same_v<std::decay_t<F>, Signal> &&
                  !std::is_same_v<std::decay_t<F>, ConstantSignal<T,E>>>>
-    Signal(F&& fn) : fn_(std::forward<F>(fn)) {}
+    Signal(F&& factory);
 
-    FrozenSignal<T,E> operator()() const { return fn_(); }
-
-    // Introspection API
-    const std::vector<std::any>& inputs() const { return inputs_; }
-    const std::any& metadata() const { return metadata_; }
-    const std::any& transform() const { return transform_; }
-
-    // Helper to populate introspection from transform
-    template<typename Transform>
-    void setFromTransform(const Transform& t, const std::vector<std::any>& inp) {
-        transform_ = std::any(t);
-        inputs_ = inp;
+    // Computation IS tree traversal — one mechanism.
+    FrozenSignal<T,E> operator()() const {
+        return transform_->apply(children_);
     }
 
+    // Recursive Constant functor F_e — deferred (needs ConstantSignal complete)
+    ConstantSignal<T,E> toConstant(E e = {}) const;
+
+    // Introspection — the SAME data used for computation
+    const std::vector<std::any>& children() const { return children_; }
+    const std::vector<std::any>& inputs() const { return children_; }  // alias
+    const std::shared_ptr<const SignalTransformBase<T,E>>& transformPtr() const { return transform_; }
+    const std::any& metadata() const { return metadata_; }
+    void setMetadata(std::any m) { metadata_ = std::move(m); }
+
+    // Backward-compat: return transform wrapped in any for old test code
+    std::any transform() const { return transform_ ? std::any(transform_) : std::any(); }
+
 protected:
-    std::function<FrozenSignal<T,E>()> fn_;
-    std::vector<std::any> inputs_;
+    struct internal_tag {};
+    Signal() = default;
+    Signal(internal_tag) {}
+
+    std::shared_ptr<const SignalTransformBase<T,E>> transform_;
+    std::vector<std::any> children_;
     std::any metadata_;
-    std::any transform_;
 
-    friend class SignalTransform<T, E>;
+    template<typename, typename, typename...>
+    friend class SignalTransform;
+
+    template<typename, typename>
+    friend class Element;
+
+    template<typename, typename>
+    friend class ConstantElement;
 };
 
 template<typename T, typename E>
-class ConstantSignal : public Signal<T,E> {
+class ConstantSignal : public Signal<T,E>, public ConstantSignalBase<E> {
 public:
+    // Leaf constant from factory — wraps in ConstantElement.
+    // Body deferred to after ConstantElement is defined.
     using ConstFn = std::function<ConstantFrozenSignal<T,E>()>;
+    ConstantSignal(ConstFn fn);
 
-    // Construct from a factory that returns ConstantFrozenSignal
-    ConstantSignal(ConstFn fn)
-        : Signal<T,E>([fn]() -> FrozenSignal<T,E> { return fn(); })
-        , constFn_(std::move(fn)) {}
+    // Tree-based constructor: same transform, constantified children.
+    ConstantSignal(std::shared_ptr<const SignalTransformBase<T,E>> t,
+                   std::vector<std::any> c)
+        : Signal<T,E>(typename Signal<T,E>::internal_tag{})
+    {
+        this->transform_ = std::move(t);
+        this->children_ = std::move(c);
+    }
 
-    // operator()() returns ConstantFrozenSignal — callable without E
-    ConstantFrozenSignal<T,E> operator()() const { return constFn_(); }
-
-private:
-    ConstFn constFn_;
+    // ONE mechanism: tree-walk, evaluate at E{}.
+    ConstantFrozenSignal<T,E> operator()() const {
+        FrozenSignal<T,E> frozen = this->transform_->apply(this->children_);
+        T val = frozen(E{});
+        return ConstantFrozenSignal<T,E>(val);
+    }
 };
 
-// Type trait to detect Signal and ConstantSignal types
+// ============================================================================
+//  Signal concept hierarchy
+//
+//  bare_t<T> strips references, cv-qualifiers, and one pointer level,
+//  yielding the underlying value type for concept checking.
+//
+//  Type suffix — matches the type directly (after decay)
+//  Arg  suffix — matches any argument form: value, reference, pointer, etc.
+//
+//  AnySignalType / AnySignalArg       — any Signal or ConstantSignal
+//  ConstantSignalType / ConstantSignalArg — ConstantSignal only
+//  VaryingSignalType / VaryingSignalArg   — Signal but not ConstantSignal
+//  NonSignal                              — anything that is not AnySignalArg
+// ============================================================================
+
+// Recursively strip references, cv-qualifiers, and all pointer indirections
 template<typename T>
-struct is_signal : std::false_type {};
-
-template<typename T, typename E>
-struct is_signal<Signal<T,E>> : std::true_type {};
-
-template<typename T, typename E>
-struct is_signal<ConstantSignal<T,E>> : std::true_type {};
-
+struct bare_impl {
+    using type = std::decay_t<T>;
+};
 template<typename T>
-inline constexpr bool is_signal_v = is_signal<T>::value;
-
+struct bare_impl<T*> {
+    using type = typename bare_impl<std::decay_t<T>>::type;
+};
 template<typename T>
-struct is_constant_signal : std::false_type {};
+using bare_t = typename bare_impl<std::decay_t<T>>::type;
+
+// --- Type concepts (direct type, no pointer unwrapping) ---
 
 template<typename T, typename E>
-struct is_constant_signal<ConstantSignal<T,E>> : std::true_type {};
-
-template<typename T>
-inline constexpr bool is_constant_signal_v = is_constant_signal<T>::value;
-
-// Helper trait to check if all args are "constant" (either ConstantSignal or primitive value)
-template<typename... Args>
-struct all_constant_or_primitive {
-    static constexpr bool value = true;
-};
-
-template<typename T, typename E, typename... Rest>
-struct all_constant_or_primitive<ConstantSignal<T, E>, Rest...> {
-    static constexpr bool value = all_constant_or_primitive<Rest...>::value;
-};
-
-template<typename T, typename E, typename... Rest>
-struct all_constant_or_primitive<ConstantSignal<T, E>*, Rest...> {
-    static constexpr bool value = all_constant_or_primitive<Rest...>::value;
-};
-
-template<typename T, typename... Rest>
-struct all_constant_or_primitive<T, Rest...> {
-    static constexpr bool value = std::is_arithmetic_v<T> && all_constant_or_primitive<Rest...>::value;
-};
-
-template<>
-struct all_constant_or_primitive<> {
-    static constexpr bool value = true;
-};
-
-// Concepts for Morphism requirements
-template<typename T, typename E>
-concept SignalArg = is_signal_v<T> || is_constant_signal_v<T>;
+concept AnySignalType = std::is_base_of_v<SignalBase<E>, std::decay_t<T>>;
 
 template<typename T, typename E>
-concept ConstantSignalArg = is_constant_signal_v<T>;
+concept ConstantSignalType = std::is_base_of_v<ConstantSignalBase<E>, std::decay_t<T>>;
 
 template<typename T, typename E>
-concept ProjectIndex = std::is_integral_v<T>;
+concept VaryingSignalType = AnySignalType<T, E> && !ConstantSignalType<T, E>;
+
+// --- Arg concepts (any argument form: value, pointer, reference) ---
+
+template<typename T, typename E>
+concept AnySignalArg = std::is_base_of_v<SignalBase<E>, bare_t<T>>;
+
+template<typename T, typename E>
+concept ConstantSignalArg = std::is_base_of_v<ConstantSignalBase<E>, bare_t<T>>;
+
+template<typename T, typename E>
+concept VaryingSignalArg = AnySignalArg<T, E> && !ConstantSignalArg<T, E>;
+
+// --- Non-signal concept ---
+
+template<typename T, typename E>
+concept NonSignal = !AnySignalArg<T, E>;
+
+// Type trait to extract the value type T from Signal<T,E> or ConstantSignal<T,E>
+template<typename S, typename E>
+struct ExtractValueType { using type = void; };
+
+template<typename T, typename E>
+struct ExtractValueType<Signal<T,E>, E> { using type = T; };
+
+template<typename T, typename E>
+struct ExtractValueType<ConstantSignal<T,E>, E> { using type = T; };
+
+template<typename S, typename E>
+using ExtractValueType_t = typename ExtractValueType<bare_t<S>, E>::type;
 
 // --- SignalTransform and subclasses ---
 
 template<typename T, typename E, typename... ValueTypes>
-class SignalTransform {
+class SignalTransform : public SignalTransformBase<T, E> {
 public:
+    using SignalFn = std::function<FrozenSignal<T,E>(Signal<ValueTypes,E>...)>;
+
     virtual ~SignalTransform() = default;
 
-    // Static factory for constant values
+    SignalTransform() = default;
+    explicit SignalTransform(SignalFn fn) : fn_(std::move(fn)) {}
+
+    // --- apply: extract typed children from vector<any>, call fn_ ---
+    FrozenSignal<T,E> apply(const std::vector<std::any>& children) const override {
+        return applyImpl(children, std::index_sequence_for<ValueTypes...>{});
+    }
+
+    // --- toConstantParts: recursively constantify each child ---
+    typename SignalTransformBase<T,E>::ConstantParts
+    toConstantParts(const std::vector<std::any>& children, const E& e) const override {
+        return toConstantPartsImpl(children, e, std::index_sequence_for<ValueTypes...>{});
+    }
+
+    // --- clone: deep copy preserving derived type ---
+    std::shared_ptr<const SignalTransformBase<T,E>> clone() const override {
+        return std::make_shared<const SignalTransform>(*this);
+    }
+
+    // --- Constant factories ---
+
+    // Constant from non-signal value
     static ConstantSignal<T, E> Constant(T value) {
         return ConstantSignal<T, E>([value]() {
             return ConstantFrozenSignal<T, E>(value);
         });
+    }
+
+    // Recursive Constant functor F_e : S → CS
+    static ConstantSignal<T, E> Constant(Signal<T, E> s, E e = {}) {
+        return s.toConstant(e);
+    }
+
+    // --- operator() ---
+
+    // All args constant-or-nonsignal, none varying → ConstantSignal
+    template<typename... Args>
+    requires ((ConstantSignalArg<Args, E> || NonSignal<Args, E>) && ...)
+          && (!(VaryingSignalArg<Args, E> || ...))
+    ConstantSignal<T, E>
+    operator()(const Args&... args) const {
+        auto normalized = std::make_tuple(normalize(args)...);
+        std::vector<std::any> children;
+        std::apply([&](const auto&... sigs) {
+            (children.push_back(std::any(sigs)), ...);
+        }, normalized);
+        return ConstantSignal<T, E>(clone(), std::move(children));
+    }
+
+    // At least one varying signal → Signal
+    template<typename... Args>
+    requires (VaryingSignalArg<Args, E> || ...)
+    Signal<T, E>
+    operator()(const Args&... args) const {
+        auto normalized = std::make_tuple(normalize(args)...);
+        std::vector<std::any> children;
+        std::apply([&](const auto&... sigs) {
+            (children.push_back(std::any(sigs)), ...);
+        }, normalized);
+        Signal<T, E> result(typename Signal<T,E>::internal_tag{});
+        result.transform_ = clone();
+        result.children_ = std::move(children);
+        return result;
     }
 
     // Metadata
@@ -189,131 +389,186 @@ public:
     std::any metadata() const { return metadata_; }
 
 protected:
+    SignalFn fn_;
     std::any metadata_;
+
+private:
+    template<std::size_t... Is>
+    FrozenSignal<T,E> applyImpl(const std::vector<std::any>& children,
+                                 std::index_sequence<Is...>) const {
+        return fn_(std::any_cast<Signal<ValueTypes, E>>(children[Is])...);
+    }
+
+    template<std::size_t... Is>
+    typename SignalTransformBase<T,E>::ConstantParts
+    toConstantPartsImpl(const std::vector<std::any>& children, const E& e,
+                        std::index_sequence<Is...>) const {
+        std::vector<std::any> const_children;
+        // Recursively constantify each child and store as Signal<V,E>
+        (const_children.push_back(std::any(
+            Signal<ValueTypes, E>(
+                std::any_cast<Signal<ValueTypes, E>>(children[Is]).toConstant(e)
+            )
+        )), ...);
+        return { clone(), std::move(const_children) };
+    }
+
+    // Normalize an argument: unwrap pointers, wrap NonSignals in Constant
+    template<typename Arg>
+    static auto normalize(const Arg& arg) {
+        if constexpr (std::is_pointer_v<std::decay_t<Arg>>) {
+            return normalize(*arg);
+        } else if constexpr (AnySignalType<Arg, E>) {
+            using V = ExtractValueType_t<Arg, E>;
+            return Signal<V, E>(static_cast<const Signal<V, E>&>(arg));
+        } else {
+            // NonSignal — wrap in Constant
+            using V = std::decay_t<Arg>;
+            return Signal<V, E>(SignalTransform<V, E>::Constant(arg));
+        }
+    }
 };
 
+// --- ConstantElement ---
+//
+// Leaf transform for constant signals. Holds a baked value T.
+// apply() returns ConstantFrozenSignal(value), ignoring children.
+
+template<typename T, typename E>
+class ConstantElement : public SignalTransformBase<T, E> {
+public:
+    explicit ConstantElement(T val) : value_(std::move(val)) {}
+
+    FrozenSignal<T,E> apply(const std::vector<std::any>&) const override {
+        T v = value_;
+        return FrozenSignal<T,E>([v](const E&) -> T { return v; });
+    }
+
+    typename SignalTransformBase<T,E>::ConstantParts
+    toConstantParts(const std::vector<std::any>& children, const E&) const override {
+        // Already constant — return self
+        return { clone(), children };
+    }
+
+    std::shared_ptr<const SignalTransformBase<T,E>> clone() const override {
+        return std::make_shared<const ConstantElement>(*this);
+    }
+
+private:
+    T value_;
+};
+
+// --- Element Transform ---
+//
+// Leaf transform for varying signals. Holds a factory () → FrozenSignal<T,E>.
+// apply() calls the factory, ignoring children.
+// toConstantParts() evaluates the factory at e, produces a ConstantElement.
+
+template<typename T, typename E>
+class Element : public SignalTransformBase<T, E> {
+public:
+    using Factory = std::function<FrozenSignal<T,E>()>;
+
+    explicit Element(Factory f) : factory_(std::move(f)) {}
+
+    FrozenSignal<T,E> apply(const std::vector<std::any>&) const override {
+        return factory_();
+    }
+
+    typename SignalTransformBase<T,E>::ConstantParts
+    toConstantParts(const std::vector<std::any>&, const E& e) const override {
+        // Evaluate the factory at e, produce a ConstantElement
+        T val = factory_()(e);
+        return {
+            std::make_shared<const ConstantElement<T,E>>(val),
+            { std::any(ConstantSignalAtom<E>{}) }
+        };
+    }
+
+    std::shared_ptr<const SignalTransformBase<T,E>> clone() const override {
+        return std::make_shared<const Element>(*this);
+    }
+
+private:
+    Factory factory_;
+};
+
+// --- Deferred definitions ---
+//
+// These need Element, ConstantElement, and ConstantSignal to be complete.
+
+// Signal leaf constructor: wraps factory in an Element
+template<typename T, typename E>
+template<typename F, typename>
+Signal<T,E>::Signal(F&& factory) {
+    auto f = std::function<FrozenSignal<T,E>()>(std::forward<F>(factory));
+    transform_ = std::make_shared<const Element<T, E>>(f);
+    children_ = { std::any(SignalAtom<E>{}) };
+}
+
+// Signal::toConstant — delegates to the transform
+template<typename T, typename E>
+ConstantSignal<T,E> Signal<T,E>::toConstant(E e) const {
+    auto [t, c] = transform_->toConstantParts(children_, e);
+    return ConstantSignal<T,E>(std::move(t), std::move(c));
+}
+
+// ConstantSignal leaf constructor: wraps factory value in a ConstantElement
+template<typename T, typename E>
+ConstantSignal<T,E>::ConstantSignal(ConstFn fn)
+    : Signal<T,E>(typename Signal<T,E>::internal_tag{})
+{
+    T val = fn()();  // evaluate once to get the baked value
+    this->transform_ = std::make_shared<const ConstantElement<T,E>>(val);
+    this->children_ = { std::any(ConstantSignalAtom<E>{}) };
+}
+
 // --- Pushforward Transform ---
+//
+// Wraps a value-level function T(ValueTypes...) into a SignalFn that
+// freezes each input signal and applies the function to the frozen values.
 
 template<typename T, typename E, typename... ValueTypes>
 class Pushforward : public SignalTransform<T, E, ValueTypes...> {
 public:
-    using Fn = std::function<T(ValueTypes...)>;
+    using ValueFn = std::function<T(ValueTypes...)>;
 
-    Pushforward(Fn fn) : fn_(std::move(fn)) {}
-
-    // All constant arguments (either ConstantSignal or primitive)
-    template<typename... Args>
-    std::enable_if_t<all_constant_or_primitive<Args...>::value, ConstantSignal<T, E>>
-    operator()(const Args&... args) {
-        auto inputs = std::vector<std::any>{std::any(args)...};
-        ConstantSignal<T, E> result(
-            [this, args...]() {
-                T val = std::apply(fn_, std::make_tuple(this->extractValue(args)()...));
-                return ConstantFrozenSignal<T, E>(val);
-            }
-        );
-        result.setFromTransform(*this, inputs);
-        return result;
-    }
-
-    // Mixed or contains at least one non-constant Signal
-    template<typename... Args>
-    std::enable_if_t<!all_constant_or_primitive<Args...>::value, Signal<T, E>>
-    operator()(const Args&... args) {
-        auto inputs = std::vector<std::any>{std::any(args)...};
-        Signal<T, E> result(
-            [this, args...]() -> FrozenSignal<T, E> {
-                auto frozen = std::make_tuple(this->normalizeToFrozen(args)...);
-                return [this, frozen](const E& e) -> T {
-                    return std::apply([this, &e](const auto&... fs) {
-                        return this->fn_(deref(fs, e)...);
+    Pushforward(ValueFn f)
+        : SignalTransform<T, E, ValueTypes...>(
+            [f](Signal<ValueTypes, E>... signals) -> FrozenSignal<T, E> {
+                auto frozen = std::make_tuple(signals()...);
+                return [f, frozen](const E& e) -> T {
+                    return std::apply([&](const auto&... fs) {
+                        return f(fs(e)...);
                     }, frozen);
                 };
             }
-        );
-        result.setFromTransform(*this, inputs);
-        return result;
+        ) {}
+
+    std::shared_ptr<const SignalTransformBase<T,E>> clone() const override {
+        return std::make_shared<const Pushforward>(*this);
     }
-
-private:
-    Fn fn_;
-
-    // Extract callable value from args - handles ConstantSignal, pointers, and primitives
-    template<typename Arg>
-    auto extractValue(const Arg& arg) const {
-        if constexpr (is_constant_signal_v<Arg>) {
-            // ConstantSignal - directly callable to get value
-            return [arg]() { return arg()(); };
-        } else if constexpr (std::is_pointer_v<Arg> && is_constant_signal_v<std::remove_pointer_t<Arg>>) {
-            // Pointer to ConstantSignal
-            return [arg]() { return (*arg)()(); };
-        } else {
-            // Primitive value - wrap to make callable
-            return [arg]() { return arg; };
-        }
-    }
-
-    // Normalize argument to FrozenSignal for evaluation
-    template<typename Arg>
-    auto normalizeToFrozen(const Arg& arg) const {
-        using ArgDecay = std::decay_t<Arg>;
-        
-        if constexpr (std::is_pointer_v<ArgDecay>) {
-            // Pointer to something - dereference and normalize
-            return normalizeToFrozen(*arg);
-        } else if constexpr (is_signal_v<ArgDecay>) {
-            // Plain Signal
-            return arg();
-        } else if constexpr (is_constant_signal_v<ArgDecay>) {
-            // ConstantSignal - wrap to yield constant
-            return FrozenSignal<T, E>([arg](const E&) { return arg()(); });
-        } else {
-            // Primitive value - wrap in FrozenSignal that ignores E
-            auto val = arg;
-            using ValType = decltype(val);
-            return FrozenSignal<T, E>([val](const E&) -> ValType { return val; });
-        }
-    }
-
-    template<typename FrozenSig>
-    auto deref(const FrozenSig& fs, const E& e) const {
-        return fs(e);
-    }
-
-    friend class Signal<T, E>;
 };
 
 // --- CastTransform ---
+//
+// A SignalTransform that casts Source → Target via static_cast.
 
 template<typename Target, typename E, typename Source>
 class CastTransform : public SignalTransform<Target, E, Source> {
 public:
-    // All constant
-    ConstantSignal<Target, E> operator()(ConstantSignal<Source, E> arg) {
-        auto inputs = std::vector<std::any>{std::any(arg)};
-        ConstantSignal<Target, E> result(
-            [arg]() {
-                Source val = arg()();
-                return ConstantFrozenSignal<Target, E>(static_cast<Target>(val));
-            }
-        );
-        result.setFromTransform(*this, inputs);
-        return result;
-    }
-
-    // Mixed or non-constant
-    Signal<Target, E> operator()(Signal<Source, E> arg) {
-        auto inputs = std::vector<std::any>{std::any(arg)};
-        Signal<Target, E> result(
-            [arg]() -> FrozenSignal<Target, E> {
+    CastTransform()
+        : SignalTransform<Target, E, Source>(
+            [](Signal<Source, E> arg) -> FrozenSignal<Target, E> {
                 FrozenSignal<Source, E> frozen = arg();
                 return [frozen](const E& e) -> Target {
                     return static_cast<Target>(frozen(e));
                 };
             }
-        );
-        result.setFromTransform(*this, inputs);
-        return result;
+        ) {}
+
+    std::shared_ptr<const SignalTransformBase<Target,E>> clone() const override {
+        return std::make_shared<const CastTransform>(*this);
     }
 };
 
@@ -325,81 +580,7 @@ class ApplyTransform : public SignalTransform<T, E, Args...> {
 };
 
 
-// ============================================================================
-//  map, pushforward, castSignal, apply
-// ============================================================================
 
-template<typename S, typename T, typename E>
-Signal<T,E> map(std::function<T(S)> f, Signal<S,E> s) {
-    return [f, s]() -> FrozenSignal<T,E> {
-        FrozenSignal<S,E> fs = s();
-        return [f, fs](const E& e) -> T { return f(fs(e)); };
-    };
-}
-
-template<typename T, typename E, typename... Ss>
-Signal<T,E> pushforward(std::function<T(Ss...)> f, Signal<Ss,E>... signals) {
-    return [f, signals...]() -> FrozenSignal<T,E> {
-        auto frozen = std::make_tuple(signals()...);
-        return [f, frozen](const E& e) -> T {
-            return std::apply([&](const auto&... fs) { return f(fs(e)...); }, frozen);
-        };
-    };
-}
-
-template<typename T, typename E, typename... Ss>
-ConstantSignal<T,E> pushforward(std::function<T(Ss...)> f, ConstantSignal<Ss,E>... signals) {
-    return ConstantSignal<T,E>([f, signals...]() {
-        T result = std::apply(f, std::make_tuple(signals()()...));
-        return ConstantFrozenSignal<T,E>(result);
-    });
-}
-
-/* abstract pushforward turned off, as its not overloadable to return ConstantSignal when given only ConstantSignal arugments, and the explicit pushforward with Signal arguments is overloadable.
-template<typename T, typename E, typename... Ss>
-std::function<Signal<T,E>(Signal<Ss,E>...)> pushforward(std::function<T(Ss...)> f) {
-    return [f](Signal<Ss,E>... signals) {
-        return pushforward<T,E,Ss...>(f, signals...);
-    };
-}*/
-
-template<typename B, typename A, typename E,
-         typename = std::enable_if_t<std::is_convertible_v<A,B>>>
-Signal<B,E> castSignal(Signal<A,E> s) {
-    return pushforward<B,E>(std::function<B(A)>([](A x){ return static_cast<B>(x); }), s);
-}
-
-template<typename T, typename E, typename... Ss>
-Signal<T,E> apply(std::function<Signal<T,E>(Ss...)> f, Signal<std::tuple<Ss...>,E> signal) {
-    return [f, signal]() -> FrozenSignal<T,E> {
-        FrozenSignal<std::tuple<Ss...>,E> frozenSignal = signal();
-        return [f, frozenSignal](const E& e) -> T {
-            std::tuple<Ss...> values = frozenSignal(e);
-            return std::apply(f, values)()(e);
-        };
-    };
-}
-
-// ============================================================================
-//  constant
-//  constant(T value, E dummy = {})     — ConstantSignal from value
-//  constant(Signal<T,E>, E dummy = {}) — freeze once, wrap in ConstantSignal
-// ============================================================================
-
-template<typename T, typename E>
-ConstantSignal<T,E> constant(T value, E dummy = {}) {
-    return ConstantSignal<T,E>([value]() {
-        return ConstantFrozenSignal<T,E>(value);
-    });
-}
-
-template<typename T, typename E>
-ConstantSignal<T,E> constant(Signal<T,E> s, E dummy = {}) {
-    return ConstantSignal<T,E>([s, dummy]() {
-        T val = s()(dummy);
-        return ConstantFrozenSignal<T,E>(val);
-    });
-}
 
 // ============================================================================
 //  Arithmetic operators
@@ -409,123 +590,135 @@ ConstantSignal<T,E> constant(Signal<T,E> s, E dummy = {}) {
 
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>())>
 Signal<R,E> operator+(Signal<S,E> a, Signal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return x+y; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return x+y; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>())>
 Signal<R,E> operator-(Signal<S,E> a, Signal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return x-y; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return x-y; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>())>
 Signal<R,E> operator*(Signal<S,E> a, Signal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return x*y; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return x*y; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>())>
 Signal<R,E> operator/(Signal<S,E> a, Signal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return y?x/y:S{}; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return y?x/y:S{}; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>())>
 Signal<R,E> operator%(Signal<S,E> a, Signal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return y?x%y:S{}; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return y?x%y:S{}; }))(a, b);
 }
 
 // (Signal, non-Signal) arithmetic operators
 
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-Signal<R,E> operator+(Signal<S,E> a, T b) { return a + constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-Signal<R,E> operator-(Signal<S,E> a, T b) { return a - constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-Signal<R,E> operator*(Signal<S,E> a, T b) { return a * constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-Signal<R,E> operator/(Signal<S,E> a, T b) { return a / constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-Signal<R,E> operator%(Signal<S,E> a, T b) { return a % constant<T,E>(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>())>
+requires NonSignal<T, E>
+Signal<R,E> operator+(Signal<S,E> a, T b) { return a + SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>())>
+requires NonSignal<T, E>
+Signal<R,E> operator-(Signal<S,E> a, T b) { return a - SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>())>
+requires NonSignal<T, E>
+Signal<R,E> operator*(Signal<S,E> a, T b) { return a * SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>())>
+requires NonSignal<T, E>
+Signal<R,E> operator/(Signal<S,E> a, T b) { return a / SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>())>
+requires NonSignal<T, E>
+Signal<R,E> operator%(Signal<S,E> a, T b) { return a % SignalTransform<T,E>::Constant(b); }
 
 // (non-Signal, Signal) arithmetic operators
 
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-Signal<R,E> operator+(S a, Signal<T,E> b) { return constant<S,E>(a) + b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-Signal<R,E> operator-(S a, Signal<T,E> b) { return constant<S,E>(a) - b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-Signal<R,E> operator*(S a, Signal<T,E> b) { return constant<S,E>(a) * b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-Signal<R,E> operator/(S a, Signal<T,E> b) { return constant<S,E>(a) / b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-Signal<R,E> operator%(S a, Signal<T,E> b) { return constant<S,E>(a) % b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>())>
+requires NonSignal<S, E>
+Signal<R,E> operator+(S a, Signal<T,E> b) { return SignalTransform<S,E>::Constant(a) + b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>())>
+requires NonSignal<S, E>
+Signal<R,E> operator-(S a, Signal<T,E> b) { return SignalTransform<S,E>::Constant(a) - b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>())>
+requires NonSignal<S, E>
+Signal<R,E> operator*(S a, Signal<T,E> b) { return SignalTransform<S,E>::Constant(a) * b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>())>
+requires NonSignal<S, E>
+Signal<R,E> operator/(S a, Signal<T,E> b) { return SignalTransform<S,E>::Constant(a) / b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>())>
+requires NonSignal<S, E>
+Signal<R,E> operator%(S a, Signal<T,E> b) { return SignalTransform<S,E>::Constant(a) % b; }
 
 // Unary minus operator
 
 template<typename T, typename E, typename R = decltype(-std::declval<T>())>
 Signal<R,E> operator-(Signal<T,E> a) {
-    return pushforward<R,E>(std::function<R(T)>([](T x){ return -x; }), a);
+    return Pushforward<R,E,T>(std::function<R(T)>([](T x){ return -x; }))(a);
 }
 
 // ConstantSignal arithmetic operators
 
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>())>
 ConstantSignal<R,E> operator+(ConstantSignal<S,E> a, ConstantSignal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return x+y; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return x+y; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>())>
 ConstantSignal<R,E> operator-(ConstantSignal<S,E> a, ConstantSignal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return x-y; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return x-y; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>())>
 ConstantSignal<R,E> operator*(ConstantSignal<S,E> a, ConstantSignal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return x*y; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return x*y; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>())>
 ConstantSignal<R,E> operator/(ConstantSignal<S,E> a, ConstantSignal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return y?x/y:S{}; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return y?x/y:S{}; }))(a, b);
 }
 template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>())>
 ConstantSignal<R,E> operator%(ConstantSignal<S,E> a, ConstantSignal<T,E> b) {
-    return pushforward<R,E>(std::function<R(S,T)>([](S x, T y){ return y?x%y:S{}; }), a, b);
+    return Pushforward<R,E,S,T>(std::function<R(S,T)>([](S x, T y){ return y?x%y:S{}; }))(a, b);
 }
 
 // (ConstantSignal, non-Signal) arithmetic operators
 
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-ConstantSignal<R,E> operator+(ConstantSignal<S,E> a, T b) { return a + constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-ConstantSignal<R,E> operator-(ConstantSignal<S,E> a, T b) { return a - constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-ConstantSignal<R,E> operator*(ConstantSignal<S,E> a, T b) { return a * constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-ConstantSignal<R,E> operator/(ConstantSignal<S,E> a, T b) { return a / constant<T,E>(b); }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>()), typename = std::enable_if_t<!is_signal_v<T>>>
-ConstantSignal<R,E> operator%(ConstantSignal<S,E> a, T b) { return a % constant<T,E>(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>())>
+requires NonSignal<T, E>
+ConstantSignal<R,E> operator+(ConstantSignal<S,E> a, T b) { return a + SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>())>
+requires NonSignal<T, E>
+ConstantSignal<R,E> operator-(ConstantSignal<S,E> a, T b) { return a - SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>())>
+requires NonSignal<T, E>
+ConstantSignal<R,E> operator*(ConstantSignal<S,E> a, T b) { return a * SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>())>
+requires NonSignal<T, E>
+ConstantSignal<R,E> operator/(ConstantSignal<S,E> a, T b) { return a / SignalTransform<T,E>::Constant(b); }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>())>
+requires NonSignal<T, E>
+ConstantSignal<R,E> operator%(ConstantSignal<S,E> a, T b) { return a % SignalTransform<T,E>::Constant(b); }
 
 // (non-Signal, ConstantSignal) arithmetic operators
 
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-ConstantSignal<R,E> operator+(S a, ConstantSignal<T,E> b) { return constant<S,E>(a) + b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-ConstantSignal<R,E> operator-(S a, ConstantSignal<T,E> b) { return constant<S,E>(a) - b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-ConstantSignal<R,E> operator*(S a, ConstantSignal<T,E> b) { return constant<S,E>(a) * b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-ConstantSignal<R,E> operator/(S a, ConstantSignal<T,E> b) { return constant<S,E>(a) / b; }
-template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>()), typename = std::enable_if_t<!is_signal_v<S>>>
-ConstantSignal<R,E> operator%(S a, ConstantSignal<T,E> b) { return constant<S,E>(a) % b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() + std::declval<T>())>
+requires NonSignal<S, E>
+ConstantSignal<R,E> operator+(S a, ConstantSignal<T,E> b) { return SignalTransform<S,E>::Constant(a) + b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() - std::declval<T>())>
+requires NonSignal<S, E>
+ConstantSignal<R,E> operator-(S a, ConstantSignal<T,E> b) { return SignalTransform<S,E>::Constant(a) - b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() * std::declval<T>())>
+requires NonSignal<S, E>
+ConstantSignal<R,E> operator*(S a, ConstantSignal<T,E> b) { return SignalTransform<S,E>::Constant(a) * b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() / std::declval<T>())>
+requires NonSignal<S, E>
+ConstantSignal<R,E> operator/(S a, ConstantSignal<T,E> b) { return SignalTransform<S,E>::Constant(a) / b; }
+template<typename S, typename T, typename E, typename R = decltype(std::declval<S>() % std::declval<T>())>
+requires NonSignal<S, E>
+ConstantSignal<R,E> operator%(S a, ConstantSignal<T,E> b) { return SignalTransform<S,E>::Constant(a) % b; }
 
 // Unary minus operator for ConstantSignal
 
 template<typename T, typename E, typename R = decltype(-std::declval<T>())>
 ConstantSignal<R,E> operator-(ConstantSignal<T,E> a) {
-    return pushforward<R,E>(std::function<R(T)>([](T x){ return -x; }), a);
+    return Pushforward<R,E,T>(std::function<R(T)>([](T x){ return -x; }))(a);
 }
 
-/*
-template<typename T, typename E, std::size_t N>
-auto diagonal(Signal<T,E> s) {
-    return pushforward(([](T x){ 
-        return []<std::size_t... Is>(T v, std::index_sequence<Is...>){ 
-            return std::make_tuple((Is, v)...);
-        }(x, std::make_index_sequence<N>{});
-    }), s);
-}*/
+
 
 
 }

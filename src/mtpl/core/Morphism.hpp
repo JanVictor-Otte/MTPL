@@ -170,7 +170,7 @@ public:
 
     template<typename... SigArgs>
     requires (sizeof...(SigArgs) == sizeof...(Ss)) && 
-             ((SignalArg<SigArgs, E> || ConstantSignalArg<SigArgs, E>) && ...) &&
+             (AnySignalArg<SigArgs, E> && ...) &&
              (std::same_as<ExtractValueType_t<SigArgs, E>, Ss> && ...)
     EventLeaf(std::optional<int> in, Fn f, SigArgs&&... sigs) {
         this->fn_ = std::move(f);
@@ -181,14 +181,14 @@ public:
 
     template<typename... SigArgs>
     requires (sizeof...(SigArgs) == sizeof...(Ss)) && 
-             ((SignalArg<SigArgs, E> || ConstantSignalArg<SigArgs,E>) && ...) &&
+             (AnySignalArg<SigArgs, E> && ...) &&
              (std::same_as<ExtractValueType_t<SigArgs, E>, Ss> && ...)
     EventLeaf(int in, Fn f, SigArgs&&... sigs)
         : EventLeaf(std::optional<int>(in), std::move(f), std::forward<SigArgs>(sigs)...) {}
 
     template<typename... SigArgs>
     requires (sizeof...(SigArgs) == sizeof...(Ss)) && 
-             ((SignalArg<SigArgs, E> || ConstantSignalArg<SigArgs, E>) && ...) &&
+             (AnySignalArg<SigArgs, E> && ...) &&
              (std::same_as<ExtractValueType_t<SigArgs, E>, Ss> && ...)
     explicit EventLeaf(Fn f, SigArgs&&... sigs)
         : EventLeaf(Variadic, std::move(f), std::forward<SigArgs>(sigs)...) {}
