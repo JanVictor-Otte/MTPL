@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MTPL"
+version = "1.0.0"
+description = "Monoidal Typed Pipeline Library — composable morphisms for event streams"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Jan Victor Otte"}
+]
+requires-python = ">=3.9"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/JanVictor-Otte/MTPL"
+Repository = "https://github.com/JanVictor-Otte/MTPL"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
