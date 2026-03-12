@@ -7,7 +7,7 @@
 | Language | Location | Install |
 |----------|----------|---------|
 | **C++20** | [`MTPL C++/MTPL/`](MTPL%20C%2B%2B/MTPL/) | Header-only — include `mtpl.hpp` |
-| **Python** | [`MTPL Python/MTPL/`](MTPL%20Python/MTPL/) | `pip install mtpl` |
+| **Python** | [`MTPL Python/MTPL/`](MTPL%20Python/MTPL/) | `pip install PyMTPL` |
 
 Each implementation has its own README with build instructions and examples.
 
